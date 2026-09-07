@@ -48,7 +48,6 @@ let
 
   initrdInit =
     let
-      # https://developer.apple.com/documentation/virtualization/running-intel-binaries-in-linux-vms-with-rosetta
       rosettaMagic = "\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00";
       rosettaMask = "\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff";
     in
@@ -73,7 +72,6 @@ let
       busybox chmod 555 /mnt/root/var/empty
       busybox mkdir -p /mnt/root/etc
 
-      # show a root user as owner of files
       busybox cat >/mnt/root/etc/passwd <<EOF
       root:!:0:0:System administrator:/root:
       nixbld:x:30000:30000:Nix build user:/var/empty:
@@ -107,21 +105,18 @@ let
         busybox udhcpc -i eth0 -s /bin/setup-network
       fi
 
-      # load modules required for mounting stuff
       modprobe virtiofs
 
       busybox mkdir -p /mnt/root/nix/store
       busybox mount -t virtiofs nix-store /mnt/root/nix/store
 
-      # mount the build root
-      busybox mkdir -p /mnt/root/build-info
-      busybox mount -t virtiofs buildroot /mnt/root/build-info
+      busybox mkdir -p /mnt/root/build-root
+      busybox mount -t virtiofs build-root /mnt/root/build-root
 
-      busybox cp -r /mnt/root/build-info /mnt/root/build
-      busybox mkdir -p /mnt/root/build
+      busybox cp -r /mnt/root/build-root /mnt/root/build
       busybox chmod 777 /mnt/root/build
 
-      BUILDER_JSON="/mnt/root/build-info/builder.json"
+      BUILDER_JSON="/mnt/root/build-root/builder.json"
 
       if [[ ! -e "$BUILDER_JSON" ]]; then
         echo "Builder json instructions did not exist! Exiting."
@@ -213,9 +208,9 @@ let
 
     set +e
     /bin/busybox setuidgid nixbld $builder $args < /dev/null
-    echo \$? > /build-info/.exitcode
+    echo \$? > /build-root/.exitcode
 
-    /bin/busybox cp -r /build /build-info
+    /bin/busybox cp -r /build /build-root
     EOF
   '';
 in

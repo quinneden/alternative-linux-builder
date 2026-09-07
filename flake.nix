@@ -1,5 +1,5 @@
 {
-  description = "external builder for linux packages on darwin";
+  description = "(alter)native-linux-builder for nix-darwin with upstream nix";
 
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
 
@@ -11,13 +11,13 @@
     in
     {
       darwinModules = {
-        default = self.darwinModules.linux-external-builder;
-        linux-external-builder = import ./module { inherit self; };
+        default = self.darwinModules.alternative-linux-builder;
+        alternative-linux-builder = import ./darwinModule.nix self;
       };
 
-      packages.${system} = nixpkgs.lib.packagesFromDirectoryRecursive {
-        directory = ./packages;
-        inherit (pkgs) callPackage;
+      packages.${system} = {
+        default = self.packages.${system}.alternative-linux-builder;
+        alternative-linux-builder = pkgs.callPackage ./alternativeLinuxBuilder { };
       };
     };
 }

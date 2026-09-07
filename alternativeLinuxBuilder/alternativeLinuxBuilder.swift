@@ -1,18 +1,19 @@
 import Foundation
 import Virtualization
 
-var initrdPath: String?
-var kernelPath: String?
-var builderJSONPath: String?
-var cores: Int = 2
-var memoryMiB: UInt64 = 4096
+var buildJSON: String?
+var cores: Int = 1
+var memoryMiB: UInt64 = defaultMemoryMiB()
+var rosetta: Bool = false
 
 var args = Array(CommandLine.arguments.dropFirst())
 
 while !args.isEmpty {
   let arg = args.removeFirst()
   switch arg {
-  case "-c", "-cores":
+  case "-h", "--help":
+    printUsageAndExit()
+  case "-c", "--cores":
     if let raw = args.first, let val = Int(raw) {
       cores = val
       args.removeFirst()
@@ -22,50 +23,63 @@ while !args.isEmpty {
       memoryMiB = val
       args.removeFirst()
     }
+  case "--rosetta":
+    rosetta = true
   default:
-    if kernelPath == nil {
-      kernelPath = arg
-    } else if initrdPath == nil {
-      initrdPath = arg
-    } else if builderJSONPath == nil {
-      builderJSONPath = arg
+    if buildJSON == nil {
+      buildJSON = arg
     } else {
-      print("Unknown argument: \(arg)")
+      print("unknown argument: \(arg)")
       exit(1)
     }
   }
 }
 
-guard let kernel = kernelPath, let initrd = initrdPath, let builderJSON = builderJSONPath else {
-  printUsageAndExit()
+guard let buildJSON else {
+  print("error: path to builder JSON was not provided")
+  exit(1)
 }
+let buildJSONURL = URL(fileURLWithPath: buildJSON, isDirectory: false)
 
-let kernelURL = URL(fileURLWithPath: kernel, isDirectory: false)
-let initrdURL = URL(fileURLWithPath: initrd, isDirectory: false)
-let builderJSONURL = URL(fileURLWithPath: builderJSON, isDirectory: false)
+guard let exeURL = Bundle.main.executableURL else {
+  print("Unable to determine executable path.")
+  exit(1)
+}
+let shareDirURL = exeURL.deletingLastPathComponent().deletingLastPathComponent()
+  .appendingPathComponent("share")
 
-let configuration = VZVirtualMachineConfiguration()
-configuration.cpuCount = cores
-configuration.memorySize = memoryMiB * 1024 * 1024
-configuration.serialPorts = [createConsoleConfiguration()]
-configuration.networkDevices = [createNetworkConfiguration()]
-configuration.bootLoader = createBootLoader(kernelURL: kernelURL, initrdURL: initrdURL)
+let initrdURL = shareDirURL.appendingPathComponent("initrd/initrd").resolvingSymlinksInPath()
+let kernelURL = shareDirURL.appendingPathComponent("kernel/Image").resolvingSymlinksInPath()
+
+let vmConfig = VZVirtualMachineConfiguration()
+
+vmConfig.bootLoader = createBootLoader(kernelURL: kernelURL, initrdURL: initrdURL)
+vmConfig.cpuCount = cores
+vmConfig.memorySize = memoryMiB * 1024 * 1024
+vmConfig.networkDevices = [createNetworkConfiguration()]
+vmConfig.serialPorts = [createConsoleConfiguration()]
 
 let buildRootURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
 let nixStoreURL = URL(fileURLWithPath: "/nix/store", isDirectory: true)
-let buildRootShare = createDirectoryShareDevice(url: buildRootURL, tag: "buildroot")
+let buildRootShare = createDirectoryShareDevice(url: buildRootURL, tag: "build-root")
 let nixStoreShare = createDirectoryShareDevice(url: nixStoreURL, tag: "nix-store")
-configuration.directorySharingDevices = [buildRootShare, nixStoreShare]
 
-do { try configuration.validate() } catch {
-  print("Failed to validate the virtual machine configuration. \(error)")
+vmConfig.directorySharingDevices = [buildRootShare, nixStoreShare]
+
+if rosetta {
+  let rosettaShare = createRosettaDirectoryShareDevice()
+  vmConfig.directorySharingDevices += [rosettaShare]
+}
+
+do { try vmConfig.validate() } catch {
+  print("Failed to validate the virtual machine configuration: \(error)")
   exit(EXIT_FAILURE)
 }
 
-let builderJSONDestURL = buildRootURL.appendingPathComponent("builder.json")
-try FileManager.default.copyItem(at: builderJSONURL, to: builderJSONDestURL)
+let builderJSONURL = buildRootURL.appendingPathComponent("builder.json")
+try FileManager.default.copyItem(at: buildJSONURL, to: builderJSONURL)
 
-let virtualMachine = VZVirtualMachine(configuration: configuration)
+let virtualMachine = VZVirtualMachine(configuration: vmConfig)
 
 let delegate = Delegate()
 virtualMachine.delegate = delegate
@@ -83,7 +97,6 @@ class Delegate: NSObject {}
 
 extension Delegate: VZVirtualMachineDelegate {
   func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-    print("The guest shut down. Exiting.")
     exit(EXIT_SUCCESS)
   }
 }
@@ -106,21 +119,9 @@ func createBootLoader(kernelURL: URL, initrdURL: URL) -> VZBootLoader {
 
 func createConsoleConfiguration() -> VZSerialPortConfiguration {
   let consoleConfiguration = VZVirtioConsoleDeviceSerialPortConfiguration()
-
-  let inputFileHandle = FileHandle.standardInput
-  let outputFileHandle = FileHandle.standardOutput
-
-  // Put stdin into raw mode, disabling local echo, input canonicalization,
-  // and CR-NL mapping.
-  var attributes = termios()
-  tcgetattr(inputFileHandle.fileDescriptor, &attributes)
-  attributes.c_iflag &= ~tcflag_t(ICRNL)
-  attributes.c_lflag &= ~tcflag_t(ICANON | ECHO)
-  tcsetattr(inputFileHandle.fileDescriptor, TCSANOW, &attributes)
-
   let stdioAttachment = VZFileHandleSerialPortAttachment(
-    fileHandleForReading: inputFileHandle,
-    fileHandleForWriting: outputFileHandle)
+    fileHandleForReading: nil,
+    fileHandleForWriting: FileHandle.standardOutput)
 
   consoleConfiguration.attachment = stdioAttachment
 
@@ -148,9 +149,32 @@ func createNetworkConfiguration() -> VZNetworkDeviceConfiguration {
   return networkConfiguration
 }
 
+func createRosettaDirectoryShareDevice() -> VZVirtioFileSystemDeviceConfiguration {
+  do {
+    let rosettaDirectoryShare = try VZLinuxRosettaDirectoryShare()
+    let rosettaDeviceConfig = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+    rosettaDeviceConfig.share = rosettaDirectoryShare
+
+    return rosettaDeviceConfig
+  } catch {
+    print("Failed to create Rosetta directory share")
+    exit(EXIT_FAILURE)
+  }
+}
+
+func defaultMemoryMiB() -> UInt64 {
+  let physicalMemoryMiB = ProcessInfo.processInfo.physicalMemory / 1024 / 1024
+  let quarter = physicalMemoryMiB / 4
+
+  let maxMiB = VZVirtualMachineConfiguration.maximumAllowedMemorySize / 1024 / 1024
+  let minMiB = VZVirtualMachineConfiguration.minimumAllowedMemorySize / 1024 / 1024
+
+  return min(max(quarter, minMiB), maxMiB)
+}
+
 func printUsageAndExit() -> Never {
   let message = """
-    Usage: \(CommandLine.arguments[0]) [options] <path-to-kernel> <path-to-initrd>
+    Usage: \(CommandLine.arguments[0]) [options] <path-to-build-json>
 
     Options:
         -c, --cores       Number of CPU cores allocated to the VM
